@@ -71,3 +71,82 @@ curl -vX POST http://localhost:8545 \
 - Go to metamask and add a new RPC for Ethereum Mainnet
   - Do not try to add it into test networks, this will not work
 - Add 'http://localhost:8545'
+
+## Zcash / Zaino over Nym
+
+`nym-rpc` also tunnels the Zcash [Zaino](https://github.com/zingolabs/zaino)
+lightwalletd-compatible gRPC service through the mixnet, for wallets like
+[zingo-cli](https://github.com/zingolabs/zingolib) / Zingo PC.
+
+```
+Wallet (zingo-cli, etc.) → local raw listener (127.0.0.1:8137) → Nym Mixnet → pinned exit (nym-rpc-server) → Zaino
+```
+
+Unlike the HTTP RPC mode above, this uses `--raw`/`--zcash` mode: the client
+opens a raw TCP listener and pipes bytes through the mixnet unmodified
+(required for gRPC, which isn't plain HTTP/JSON), and the server pins every
+session to a single upstream instead of letting clients choose one.
+
+### Server (VM running Zaino)
+
+```bash
+./target/release/nym-rpc-server \
+  --config-dir /var/lib/nym-rpc/state \
+  --pin-upstream 127.0.0.1:8137
+```
+
+`--pin-upstream <host:port>` is **required** for public operation — without
+it the server is an open relay that forwards to whatever upstream a client
+requests. It prints its Nym address on startup (also available at
+`GET /api/v1/nym-address` on the HTTP API, default `127.0.0.1:8080`); publish
+that address to your users. Two more flags harden a public deployment:
+`--session-idle-timeout <secs>` (default `3600`) closes sessions with no
+traffic in either direction, and `--max-sessions <n>` (default `512`) caps
+concurrent sessions. Monitoring stats (active/total sessions, bytes
+forwarded) are exposed at `GET /api/v1/stats`.
+
+### Client (laptop)
+
+```bash
+./target/release/nym-rpc-client --zcash -x <NYM_ADDRESS>
+```
+
+`--zcash` is a preset for `--raw` mode that listens on `127.0.0.1:8137` and
+targets a Zaino upstream; `-x <NYM_ADDRESS>` is the server's Nym address from
+above (required — there's no default exit node for Zcash traffic until one is
+published as `ZCASH_SERVICE_NYM_ADDRESS` in `src/client_config.rs`).
+
+### Connect your wallet
+
+Point your wallet at `http://127.0.0.1:8137` as its lightwalletd server, e.g.:
+
+```bash
+zingo-cli --server http://127.0.0.1:8137 --data-dir /tmp/zingo-nym-test info
+```
+
+**Limitation**: initial wallet sync over the mixnet is slow (the mixnet adds
+latency and the sync involves fetching a large range of compact blocks), so
+this tunnel is best suited for wallets that already have a synced state —
+i.e. periodic refresh and transaction submission — rather than syncing a
+wallet from birth height for the first time.
+
+### Operator smoke test
+
+After deploying `nym-rpc-server` pinned at a live `zainod`/Zaino instance,
+verify the tunnel end-to-end before publishing the Nym address:
+
+```bash
+# terminal 1 (on the VM, or a machine with zainod at 127.0.0.1:8137)
+./target/release/nym-rpc-server --config-dir /tmp/nym-rpc-zcash --pin-upstream 127.0.0.1:8137
+# note the printed Nym address
+
+# terminal 2 (laptop)
+./target/release/nym-rpc-client --zcash -x <NYM_ADDRESS>
+
+# terminal 3 (laptop) — zingo-cli from zingolib
+cargo run --release --package zingo-cli -- \
+  --server http://127.0.0.1:8137 --data-dir /tmp/zingo-nym-test info
+```
+
+Expected: `info` returns the lightwalletd info block (vendor/taddr height)
+through the mixnet.
