@@ -1,0 +1,54 @@
+name: release
+
+# Cut a release by pushing a version tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+# The binaries are built first; the GitHub Release is only published if the
+# build succeeds (steps run in order and a failed build fails the job).
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # required for the GITHUB_TOKEN to create the release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build binaries + publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries (release)
+        run: cargo build --release --locked --bin nym-rpc-client --bin nym-rpc-server
+
+      - name: Stage release assets
+        run: |
+          mkdir -p dist
+          cp target/release/nym-rpc-client  dist/nym-rpc-client-linux-x86_64
+          cp target/release/nym-rpc-server  dist/nym-rpc-server-linux-x86_64
+          cd dist
+          sha256sum nym-rpc-client-linux-x86_64 nym-rpc-server-linux-x86_64 > SHA256SUMS
+          ls -l
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/nym-rpc-client-linux-x86_64
+            dist/nym-rpc-server-linux-x86_64
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
