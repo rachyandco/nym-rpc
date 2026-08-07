@@ -87,7 +87,14 @@ async fn main() -> Result<()> {
     .await?;
 
     // Start HTTP server if enabled
-    let _http_handle = start_http_server(&server.nym_address(), startup_time, &http_config).await?;
+    let _http_handle = start_http_server(
+        server.nym_address(),
+        startup_time,
+        &http_config,
+        server.stats(),
+        server.sessions(),
+    )
+    .await?;
 
     info!("✓ Server initialized successfully");
     info!("Nym address: {}", server.nym_address());

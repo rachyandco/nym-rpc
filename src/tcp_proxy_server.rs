@@ -21,6 +21,7 @@ use nym_sdk::mixnet::{
 use nym_sdk::tcp_proxy::utils::{MessageBuffer, Payload, ProxiedMessage};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
@@ -30,6 +31,16 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 
 type UpstreamAddress = String;
+
+/// Monitoring counters for a `TcpProxyServer` instance, exposed via the HTTP
+/// stats endpoint. All fields use relaxed ordering since these are simple
+/// independent counters with no ordering requirements between them.
+#[derive(Default)]
+pub struct ProxyStats {
+    pub total_sessions: AtomicU64,
+    pub bytes_to_upstream: AtomicU64,
+    pub bytes_from_upstream: AtomicU64,
+}
 
 /// Removes a session's entry from the shared sessions map when dropped, so the
 /// session is pruned regardless of which path `session_handler` exits through
@@ -52,6 +63,7 @@ impl Drop for SessionPruneGuard {
 
 pub struct TcpProxyServer {
     sessions: Arc<DashMap<Uuid, UpstreamAddress>>,
+    stats: Arc<ProxyStats>,
     mixnet_client: MixnetClient,
     mixnet_client_sender: Arc<RwLock<MixnetClientSender>>,
     tx: tokio::sync::watch::Sender<Option<(ProxiedMessage, AnonymousSenderTag)>>,
@@ -106,6 +118,7 @@ impl TcpProxyServer {
 
         Ok(TcpProxyServer {
             sessions: Arc::new(DashMap::new()),
+            stats: Arc::new(ProxyStats::default()),
             mixnet_client: client,
             mixnet_client_sender: sender,
             tx,
@@ -125,6 +138,7 @@ impl TcpProxyServer {
         let mixnet_sender = self.mixnet_client_sender();
         let tx = self.tx.clone();
         let sessions = self.sessions();
+        let stats = self.stats();
         let pinned_upstream = self.pinned_upstream.clone();
         let session_idle_timeout = self.session_idle_timeout;
         let max_sessions = self.max_sessions;
@@ -192,6 +206,7 @@ impl TcpProxyServer {
 
                             // Store session
                             sessions.insert(session_id, upstream_address.clone());
+                            stats.total_sessions.fetch_add(1, Ordering::Relaxed);
 
                             tokio::spawn(Self::session_handler(
                                 upstream_address,
@@ -201,6 +216,7 @@ impl TcpProxyServer {
                                 handle_token.clone(),
                                 sessions.clone(),
                                 session_idle_timeout,
+                                stats.clone(),
                             ));
 
                             info!("Spawned a new session handler: {}", session_id);
@@ -236,6 +252,7 @@ impl TcpProxyServer {
     // Then we spawn 2 tasks:
     // - 'Incoming' thread => deals with parsing and storing the SURB (used in Mixnet replies), deserialising and passing the incoming data from the Mixnet to the upstream server.
     // - 'Outgoing' thread => frames bytes coming from TcpStream (the server) and deals with ordering + sending reply anonymously => Mixnet.
+    #[allow(clippy::too_many_arguments)]
     async fn session_handler(
         upstream_address: String,
         session_id: Uuid,
@@ -244,6 +261,7 @@ impl TcpProxyServer {
         cancel_token: CancellationToken,
         sessions: Arc<DashMap<Uuid, UpstreamAddress>>,
         idle_timeout: std::time::Duration,
+        stats: Arc<ProxyStats>,
     ) -> Result<()> {
         // Ensures the session is pruned from the shared map on every exit path,
         // including early returns via `?` (e.g. connect/write errors), not just
@@ -267,6 +285,7 @@ impl TcpProxyServer {
         // Used for anonymous replies per session. Initially parsed from the incoming message.
         let send_side_surb = Arc::clone(&global_surb);
         let last_activity_up = Arc::clone(&last_activity);
+        let stats_up = Arc::clone(&stats);
 
         tokio::spawn(async move {
             let mut message_id = 0;
@@ -285,6 +304,9 @@ impl TcpProxyServer {
             while let Some(Ok(bytes)) = framed_read.next().await {
                 *last_activity_up.lock().unwrap() = tokio::time::Instant::now();
                 info!("Server received {} bytes", bytes.len());
+                stats_up
+                    .bytes_from_upstream
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 let reply =
                     ProxiedMessage::new(Payload::Data(bytes.to_vec()), session_id, message_id);
                 message_id += 1;
@@ -318,6 +340,14 @@ impl TcpProxyServer {
                             }
 
                             *last_activity.lock().unwrap() = tokio::time::Instant::now();
+
+                            let payload_len = match message.message() {
+                                Payload::Data(data) => data.len(),
+                                Payload::Close => 0,
+                            };
+                            stats
+                                .bytes_to_upstream
+                                .fetch_add(payload_len as u64, Ordering::Relaxed);
 
                             msg_buffer.push(message);
 
@@ -365,6 +395,10 @@ impl TcpProxyServer {
 
     pub fn sessions(&self) -> Arc<DashMap<Uuid, UpstreamAddress>> {
         Arc::clone(&self.sessions)
+    }
+
+    pub fn stats(&self) -> Arc<ProxyStats> {
+        Arc::clone(&self.stats)
     }
 
     pub fn mixnet_client_sender(&self) -> Arc<RwLock<MixnetClientSender>> {

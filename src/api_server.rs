@@ -2,15 +2,19 @@
 //! provides NYM-like API endpoints for nym-rpc-server
 //! This can be expanded to provide more endpoints if needed
 
+use crate::tcp_proxy_server::ProxyStats;
 use anyhow::Result;
 use axum::{Json, Router, extract::State, response::Html};
+use dashmap::DashMap;
 use nym_node_requests::api::v1::health::models::NodeHealth;
 use nym_node_requests::api::v1::node::models::NodeDescription;
 use nym_sdk::mixnet::Recipient;
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
+use uuid::Uuid;
 
 // configuration for our TCP proxy with HTTP API
 #[derive(Debug, Clone)]
@@ -36,6 +40,8 @@ pub struct TcpProxyAppState {
     pub description: NodeDescription,
     pub nym_address: Recipient,
     pub startup_time: Instant,
+    pub stats: Arc<ProxyStats>,
+    pub sessions: Arc<DashMap<Uuid, String>>,
 }
 
 /// Build HTTP server with Nym-compatible endpoints
@@ -43,11 +49,15 @@ pub async fn build_http_server(
     nym_address: &Recipient,
     startup_time: Instant,
     http_config: &TcpProxyHttpConfig,
+    stats: Arc<ProxyStats>,
+    sessions: Arc<DashMap<Uuid, String>>,
 ) -> Result<Router> {
     let state = TcpProxyAppState {
         description: http_config.description.clone(),
         nym_address: *nym_address,
         startup_time,
+        stats,
+        sessions,
     };
 
     let router = Router::new()
@@ -60,6 +70,7 @@ pub async fn build_http_server(
             "/api/v1/nym-address",
             axum::routing::get(tcp_proxy_nym_address),
         )
+        .route("/api/v1/stats", axum::routing::get(tcp_proxy_stats))
         .route("/", axum::routing::get(landing_page))
         .with_state(state);
 
@@ -71,8 +82,10 @@ pub async fn start_http_server(
     nym_address: &Recipient,
     startup_time: Instant,
     http_config: &TcpProxyHttpConfig,
+    stats: Arc<ProxyStats>,
+    sessions: Arc<DashMap<Uuid, String>>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let router = build_http_server(nym_address, startup_time, http_config).await?;
+    let router = build_http_server(nym_address, startup_time, http_config, stats, sessions).await?;
     let bind_address = http_config.bind_address;
 
     info!(
@@ -121,6 +134,18 @@ pub async fn tcp_proxy_nym_address(
     }))
 }
 
+/// Returns monitoring stats for this TCP proxy: active/total sessions and
+/// cumulative bytes forwarded in each direction.
+pub async fn tcp_proxy_stats(State(state): State<TcpProxyAppState>) -> Json<serde_json::Value> {
+    use std::sync::atomic::Ordering::Relaxed;
+    Json(json!({
+        "active_sessions": state.sessions.len(),
+        "total_sessions": state.stats.total_sessions.load(Relaxed),
+        "bytes_to_upstream": state.stats.bytes_to_upstream.load(Relaxed),
+        "bytes_from_upstream": state.stats.bytes_from_upstream.load(Relaxed),
+    }))
+}
+
 /// Landing page
 pub async fn landing_page() -> Html<&'static str> {
     Html(
@@ -133,6 +158,7 @@ pub async fn landing_page() -> Html<&'static str> {
                 <li><a href="/api/v1/description">/api/v1/description</a> - Node description (Nym-compatible)</li>
                 <li><a href="/api/v1/health">/api/v1/health</a> - Health check (Nym-compatible)</li>
                 <li><a href="/api/v1/nym-address">/api/v1/nym-address</a> - Nym mixnet address</li>
+                <li><a href="/api/v1/stats">/api/v1/stats</a> - Monitoring stats (sessions, bytes forwarded)</li>
             </ul>
             <p>This server reuses Nym's HTTP API components for maximum compatibility.</p>
         </div>
