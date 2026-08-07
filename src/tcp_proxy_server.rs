@@ -9,7 +9,7 @@
 //! - Uses surbs to anonymize the response
 //! TODO: prune sessions, allowlist providers, test session_handler
 
-use crate::common::extract_upstream_header;
+use crate::common::{extract_upstream_header, resolve_upstream};
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use nym_network_defaults::setup_env;
@@ -32,7 +32,7 @@ use uuid::Uuid;
 type UpstreamAddress = String;
 
 pub struct TcpProxyServer {
-    sessions: DashMap<Uuid, UpstreamAddress>,
+    sessions: Arc<DashMap<Uuid, UpstreamAddress>>,
     mixnet_client: MixnetClient,
     mixnet_client_sender: Arc<RwLock<MixnetClientSender>>,
     tx: tokio::sync::watch::Sender<Option<(ProxiedMessage, AnonymousSenderTag)>>,
@@ -40,11 +40,16 @@ pub struct TcpProxyServer {
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     cancel_token: CancellationToken,
+    pinned_upstream: Option<String>,
 }
 
 impl TcpProxyServer {
     // create mixnet client
-    pub async fn new(config_dir: &str, env: Option<String>) -> Result<Self> {
+    pub async fn new(
+        config_dir: &str,
+        env: Option<String>,
+        pinned_upstream: Option<String>,
+    ) -> Result<Self> {
         info!("creating client");
         debug!("Loading env file: {:?}", env);
         setup_env(env);
@@ -77,7 +82,7 @@ impl TcpProxyServer {
         info!("Client created: {}", client.nym_address());
 
         Ok(TcpProxyServer {
-            sessions: DashMap::new(),
+            sessions: Arc::new(DashMap::new()),
             mixnet_client: client,
             mixnet_client_sender: sender,
             tx,
@@ -85,6 +90,7 @@ impl TcpProxyServer {
             cancel_token: CancellationToken::new(),
             shutdown_tx,
             shutdown_rx,
+            pinned_upstream,
         })
     }
 
@@ -93,7 +99,8 @@ impl TcpProxyServer {
         let rx = self.rx();
         let mixnet_sender = self.mixnet_client_sender();
         let tx = self.tx.clone();
-        let sessions = self.sessions().clone();
+        let sessions = self.sessions();
+        let pinned_upstream = self.pinned_upstream.clone();
 
         let mut shutdown_rx =
             std::mem::replace(&mut self.shutdown_rx, tokio::sync::mpsc::channel(1).1);
@@ -130,22 +137,26 @@ impl TcpProxyServer {
                         if !sessions.contains_key(&session_id) {
                             debug!("Got message for a new session");
 
-                            let (upstream_address, stripped_data) = match message.message() {
+                            let (client_upstream, stripped_data) = match message.message() {
                                 Payload::Data(data) => extract_upstream_header(data),
                                 Payload::Close => {
                                     error!("First message cannot be Close");
                                     continue;
                                 }
                             };
+                            message.message = Payload::Data(stripped_data);
 
-                            if upstream_address.is_empty() {
-                                error!("Upstream address is missing!");
-                                continue;
+                            let upstream_address = match resolve_upstream(pinned_upstream.as_deref(), &client_upstream) {
+                                Some(addr) => addr,
+                                None => {
+                                    error!("No upstream available for session {}, dropping", session_id);
+                                    continue;
+                                }
+                            };
+                            if pinned_upstream.is_some() && client_upstream != upstream_address {
+                                debug!("Ignoring client-supplied upstream {:?} (pinned)", client_upstream);
                             }
                             info!("Upstream address: {}", upstream_address);
-
-                            // Update the message with the stripped data
-                            message.message = Payload::Data(stripped_data);
 
                             // Store session
                             sessions.insert(session_id, upstream_address.clone());
@@ -298,8 +309,8 @@ impl TcpProxyServer {
         &mut self.mixnet_client
     }
 
-    pub fn sessions(&self) -> &DashMap<Uuid, UpstreamAddress> {
-        &self.sessions
+    pub fn sessions(&self) -> Arc<DashMap<Uuid, UpstreamAddress>> {
+        Arc::clone(&self.sessions)
     }
 
     pub fn mixnet_client_sender(&self) -> Arc<RwLock<MixnetClientSender>> {
@@ -323,7 +334,8 @@ mod tests {
     #[tokio::test]
     async fn test_run_with_shutdown() -> Result<()> {
         let config_dir = TempDir::new()?;
-        let mut server = TcpProxyServer::new(config_dir.path().to_str().unwrap(), None).await?;
+        let mut server =
+            TcpProxyServer::new(config_dir.path().to_str().unwrap(), None, None).await?;
 
         // Getter for shutdown signal tx
         let shutdown_tx = server.disconnect_signal();

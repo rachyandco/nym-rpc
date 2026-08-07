@@ -4,7 +4,7 @@ use nym_node_requests::api::v1::node::models::NodeDescription;
 use nym_rpc::api_server::{TcpProxyHttpConfig, start_http_server};
 use nym_rpc::tcp_proxy_server::TcpProxyServer;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Parser)]
 #[command(name = "nym-rpc-server")]
@@ -28,6 +28,11 @@ struct Args {
     // if none provided we use the default mainnet env file
     #[clap(short, long)]
     env: Option<String>,
+
+    /// Pin all sessions to this upstream (host:port). REQUIRED for public
+    /// operation — without it clients choose the upstream (open relay).
+    #[clap(long)]
+    pin_upstream: Option<String>,
 }
 
 #[tokio::main]
@@ -56,7 +61,15 @@ async fn main() -> Result<()> {
         expose_system_info: true,
     };
 
-    let mut server = TcpProxyServer::new(&config_dir, args.env).await?;
+    match &args.pin_upstream {
+        Some(pin) => info!("Upstream pinning ACTIVE: all sessions forced to {}", pin),
+        None => warn!(
+            "Upstream pinning DISABLED: clients may choose any upstream address (open relay). \
+             Pass --pin-upstream <host:port> for public operation."
+        ),
+    }
+
+    let mut server = TcpProxyServer::new(&config_dir, args.env, args.pin_upstream).await?;
 
     // Start HTTP server if enabled
     let _http_handle = start_http_server(&server.nym_address(), startup_time, &http_config).await?;
