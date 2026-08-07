@@ -105,6 +105,14 @@ traffic in either direction, and `--max-sessions <n>` (default `512`) caps
 concurrent sessions. Monitoring stats (active/total sessions, bytes
 forwarded) are exposed at `GET /api/v1/stats`.
 
+> ⚠️ On a public deployment the HTTP API listener **must** stay on loopback or
+> behind a firewall (never `0.0.0.0`): the live session and byte counters in
+> `/api/v1/stats` are traffic-sensitive and would let an observer correlate
+> mixnet flows with this exit, undermining the anonymity the tunnel provides.
+> Note also that the mixnet only encrypts traffic between the client and this
+> exit — the exit↔Zaino hop is plaintext h2c, so Zaino must likewise stay
+> bound to loopback on the same host.
+
 ### Client (laptop)
 
 ```bash

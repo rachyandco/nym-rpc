@@ -61,6 +61,17 @@ impl Drop for SessionPruneGuard {
     }
 }
 
+/// Aborts the detached upstream→client reader task when dropped, so a session
+/// that ends (idle timeout, close, or error) cannot keep relaying upstream
+/// bytes via SURB after the handler has exited.
+struct AbortOnDrop(tokio::task::JoinHandle<Result<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct TcpProxyServer {
     sessions: Arc<DashMap<Uuid, UpstreamAddress>>,
     stats: Arc<ProxyStats>,
@@ -175,6 +186,24 @@ impl TcpProxyServer {
 
                         let session_id = message.session_id();
 
+                        // The client adds the UPSTREAM header only to message_id == 1, but
+                        // the mixnet does not preserve ordering: a later message can create
+                        // the session before message 1 arrives. Strip the header from every
+                        // message_id == 1 — whether or not it creates the session — so the
+                        // header bytes never reach the upstream write path.
+                        let header_upstream = if message.message_id() == 1 {
+                            match message.message() {
+                                Payload::Data(data) => {
+                                    let (upstream, stripped_data) = extract_upstream_header(data);
+                                    message.message = Payload::Data(stripped_data);
+                                    Some(upstream)
+                                }
+                                Payload::Close => None,
+                            }
+                        } else {
+                            None
+                        };
+
                         if !sessions.contains_key(&session_id) {
                             debug!("Got message for a new session");
 
@@ -183,14 +212,17 @@ impl TcpProxyServer {
                                 continue;
                             }
 
-                            let (client_upstream, stripped_data) = match message.message() {
-                                Payload::Data(data) => extract_upstream_header(data),
+                            let client_upstream = match message.message() {
+                                // Empty when the session-creating message is not message 1
+                                // (out-of-order arrival) — resolve_upstream then falls back
+                                // to the pin, or drops the session when no pin is set,
+                                // exactly as before.
+                                Payload::Data(_) => header_upstream.unwrap_or_default(),
                                 Payload::Close => {
                                     error!("First message cannot be Close");
                                     continue;
                                 }
                             };
-                            message.message = Payload::Data(stripped_data);
 
                             let upstream_address = match resolve_upstream(pinned_upstream.as_deref(), &client_upstream) {
                                 Some(addr) => addr,
@@ -287,7 +319,7 @@ impl TcpProxyServer {
         let last_activity_up = Arc::clone(&last_activity);
         let stats_up = Arc::clone(&stats);
 
-        tokio::spawn(async move {
+        let upstream_reader = tokio::spawn(async move {
             let mut message_id = 0;
             // Since we're just trying to pipe whatever bytes our client/server are normally sending to each other,
             // the bytescodec is fine to use here; we're trying to avoid modifying this stream e.g. in the process of Sphinx packet
@@ -303,7 +335,7 @@ impl TcpProxyServer {
             // - If tick() returns true, close session.
             while let Some(Ok(bytes)) = framed_read.next().await {
                 *last_activity_up.lock().unwrap() = tokio::time::Instant::now();
-                info!("Server received {} bytes", bytes.len());
+                debug!("Server received {} bytes", bytes.len());
                 stats_up
                     .bytes_from_upstream
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
@@ -325,11 +357,22 @@ impl TcpProxyServer {
             }
             Ok::<(), anyhow::Error>(())
         });
+        // Declared after `_session_prune_guard` so it drops first on any exit
+        // path (including `?`): the reader is aborted, then the prune guard
+        // removes the session from the map and logs the removal.
+        let _upstream_reader_guard = AbortOnDrop(upstream_reader);
 
         let messages_accounter = Arc::new(DashSet::new());
         messages_accounter.insert(1);
 
         let mut msg_buffer = MessageBuffer::new();
+        // Use an Interval rather than a fresh `sleep` per loop iteration: `rx` is
+        // a watch channel woken by EVERY inbound mixnet message across ALL
+        // sessions, so a recreated sleep future would never fire under load and
+        // idle sessions would never be reaped. An Interval keeps its deadline
+        // across recreated `tick()` futures.
+        let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                     _ = rx.changed() => {
@@ -366,7 +409,7 @@ impl TcpProxyServer {
                     _ = cancel_token.cancelled() => {
                         break;
                     }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                    _ = flush_interval.tick() => {
                         msg_buffer.tick(&mut write).await?;
 
                         if last_activity.lock().unwrap().elapsed() > idle_timeout {

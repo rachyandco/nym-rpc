@@ -187,7 +187,7 @@ impl TcpProxyClient {
                     bytes_vec
                 };
 
-                info!(
+                debug!(
                     "Sent message with id {} for session {} of {} bytes",
                     message_id,
                     session_id,

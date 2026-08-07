@@ -12,7 +12,8 @@ use tracing::{error, info, warn};
     about = "Receives RPC requests through the mixnet, forwards them to the specified RPC provider, and replies with the response via SURBs"
 )]
 struct Args {
-    // listen address for the HTTP API
+    /// Listen address for the HTTP API. Keep on loopback / behind a firewall
+    /// for public deployments: /api/v1/stats exposes traffic-sensitive counters
     #[clap(long, default_value = "127.0.0.1")]
     api_listen_address: String,
 
