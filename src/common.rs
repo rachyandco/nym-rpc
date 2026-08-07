@@ -35,6 +35,18 @@ pub fn extract_upstream_header(data: &[u8]) -> (String, Vec<u8>) {
     }
 }
 
+/// Decide which upstream a new session may connect to.
+/// When a pin is configured (public service mode) the client-supplied
+/// address is ignored entirely — otherwise the server would be an open
+/// relay to arbitrary TCP targets.
+pub fn resolve_upstream(pinned: Option<&str>, client_supplied: &str) -> Option<String> {
+    match pinned {
+        Some(pin) => Some(pin.to_string()),
+        None if client_supplied.is_empty() => None,
+        None => Some(client_supplied.to_string()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RpcProviderUrl {
     pub full_host: String,
@@ -105,6 +117,35 @@ mod tests {
         let empty_data = &[];
         let (_, result) = extract_upstream_header(empty_data);
         assert_eq!(result, empty_data);
+    }
+
+    #[test]
+    fn test_resolve_upstream_pin_overrides_client() {
+        assert_eq!(
+            resolve_upstream(Some("127.0.0.1:8137"), "evil.example.com:22"),
+            Some("127.0.0.1:8137".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_pin_with_empty_client() {
+        assert_eq!(
+            resolve_upstream(Some("127.0.0.1:8137"), ""),
+            Some("127.0.0.1:8137".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_no_pin_passthrough() {
+        assert_eq!(
+            resolve_upstream(None, "10.0.0.1:8545"),
+            Some("10.0.0.1:8545".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_upstream_no_pin_empty_rejects() {
+        assert_eq!(resolve_upstream(None, ""), None);
     }
 }
 
