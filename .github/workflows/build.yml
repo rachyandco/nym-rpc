@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build nym-rpc-client + nym-rpc-server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # nym-sdk (pulled from git) drags in tonic/prost; protoc must be present.
+      # pkg-config + libssl-dev are already on ubuntu-latest but pinned here so
+      # the build doesn't silently depend on the runner image.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      # edition 2024 needs a recent stable (>= 1.85); @stable tracks latest.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries (release)
+        run: cargo build --release --locked --bin nym-rpc-client --bin nym-rpc-server
+
+      # Compile the test suite so test code can't rot, but do NOT run it here:
+      # the raw_tunnel e2e (and test_run_with_shutdown) talk to the live Nym
+      # mixnet, which isn't available/deterministic on CI.
+      - name: Compile tests (no run — e2e needs a live mixnet)
+        run: cargo test --no-run --locked
+
+      - name: Upload built binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: nym-rpc-binaries
+          path: |
+            target/release/nym-rpc-client
+            target/release/nym-rpc-server
+          if-no-files-found: error
