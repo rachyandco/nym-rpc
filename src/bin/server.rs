@@ -33,6 +33,10 @@ struct Args {
     /// operation — without it clients choose the upstream (open relay).
     #[clap(long)]
     pin_upstream: Option<String>,
+
+    /// Close sessions with no traffic in either direction for this many seconds
+    #[clap(long, default_value_t = 3600)]
+    session_idle_timeout: u64,
 }
 
 #[tokio::main]
@@ -69,7 +73,13 @@ async fn main() -> Result<()> {
         ),
     }
 
-    let mut server = TcpProxyServer::new(&config_dir, args.env, args.pin_upstream).await?;
+    let mut server = TcpProxyServer::new(
+        &config_dir,
+        args.env,
+        args.pin_upstream,
+        args.session_idle_timeout,
+    )
+    .await?;
 
     // Start HTTP server if enabled
     let _http_handle = start_http_server(&server.nym_address(), startup_time, &http_config).await?;

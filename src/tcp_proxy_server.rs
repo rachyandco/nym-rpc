@@ -7,7 +7,7 @@
 //! - Forward to the upstream server
 //! - Handle the response from the upstream server and send it back to the mixnet
 //! - Uses surbs to anonymize the response
-//! TODO: prune sessions, allowlist providers, test session_handler
+//! TODO: allowlist providers, test session_handler
 
 use crate::common::{extract_upstream_header, resolve_upstream};
 use anyhow::Result;
@@ -31,6 +31,25 @@ use uuid::Uuid;
 
 type UpstreamAddress = String;
 
+/// Removes a session's entry from the shared sessions map when dropped, so the
+/// session is pruned regardless of which path `session_handler` exits through
+/// (normal loop break, idle timeout, or an early `?` on a connection/write error).
+struct SessionPruneGuard {
+    sessions: Arc<DashMap<Uuid, UpstreamAddress>>,
+    session_id: Uuid,
+}
+
+impl Drop for SessionPruneGuard {
+    fn drop(&mut self) {
+        self.sessions.remove(&self.session_id);
+        info!(
+            "Session {} removed, {} active",
+            self.session_id,
+            self.sessions.len()
+        );
+    }
+}
+
 pub struct TcpProxyServer {
     sessions: Arc<DashMap<Uuid, UpstreamAddress>>,
     mixnet_client: MixnetClient,
@@ -41,6 +60,7 @@ pub struct TcpProxyServer {
     shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     cancel_token: CancellationToken,
     pinned_upstream: Option<String>,
+    session_idle_timeout: std::time::Duration,
 }
 
 impl TcpProxyServer {
@@ -49,6 +69,7 @@ impl TcpProxyServer {
         config_dir: &str,
         env: Option<String>,
         pinned_upstream: Option<String>,
+        idle_timeout_secs: u64,
     ) -> Result<Self> {
         info!("creating client");
         debug!("Loading env file: {:?}", env);
@@ -91,6 +112,7 @@ impl TcpProxyServer {
             shutdown_tx,
             shutdown_rx,
             pinned_upstream,
+            session_idle_timeout: std::time::Duration::from_secs(idle_timeout_secs),
         })
     }
 
@@ -101,6 +123,7 @@ impl TcpProxyServer {
         let tx = self.tx.clone();
         let sessions = self.sessions();
         let pinned_upstream = self.pinned_upstream.clone();
+        let session_idle_timeout = self.session_idle_timeout;
 
         let mut shutdown_rx =
             std::mem::replace(&mut self.shutdown_rx, tokio::sync::mpsc::channel(1).1);
@@ -166,7 +189,9 @@ impl TcpProxyServer {
                                 session_id,
                                 rx.clone(),
                                 mixnet_sender.clone(),
-                                handle_token.clone()
+                                handle_token.clone(),
+                                sessions.clone(),
+                                session_idle_timeout,
                             ));
 
                             info!("Spawned a new session handler: {}", session_id);
@@ -208,19 +233,31 @@ impl TcpProxyServer {
         mut rx: Receiver<Option<(ProxiedMessage, AnonymousSenderTag)>>,
         sender: Arc<RwLock<MixnetClientSender>>,
         cancel_token: CancellationToken,
+        sessions: Arc<DashMap<Uuid, UpstreamAddress>>,
+        idle_timeout: std::time::Duration,
     ) -> Result<()> {
+        // Ensures the session is pruned from the shared map on every exit path,
+        // including early returns via `?` (e.g. connect/write errors), not just
+        // a normal fall-through past the bottom of the loop.
+        let _session_prune_guard = SessionPruneGuard {
+            sessions,
+            session_id,
+        };
+
         let global_surb = Arc::new(RwLock::new(None));
+        let last_activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
 
         debug!(
             "Connecting to upstream server {} for session {}",
             upstream_address, session_id
         );
-        let stream = TcpStream::connect(upstream_address).await?;
+        let stream = TcpStream::connect(&upstream_address).await?;
 
         // Split our tcpstream into OwnedRead and OwnedWrite halves for concurrent read/writing.
         let (read, mut write) = stream.into_split();
         // Used for anonymous replies per session. Initially parsed from the incoming message.
         let send_side_surb = Arc::clone(&global_surb);
+        let last_activity_up = Arc::clone(&last_activity);
 
         tokio::spawn(async move {
             let mut message_id = 0;
@@ -237,6 +274,7 @@ impl TcpProxyServer {
             // - Send serialised reply => Mixnet via SURB.
             // - If tick() returns true, close session.
             while let Some(Ok(bytes)) = framed_read.next().await {
+                *last_activity_up.lock().unwrap() = tokio::time::Instant::now();
                 info!("Server received {} bytes", bytes.len());
                 let reply =
                     ProxiedMessage::new(Payload::Data(bytes.to_vec()), session_id, message_id);
@@ -270,6 +308,8 @@ impl TcpProxyServer {
                                 continue;
                             }
 
+                            *last_activity.lock().unwrap() = tokio::time::Instant::now();
+
                             msg_buffer.push(message);
 
                             let local_surb = Arc::clone(&global_surb);
@@ -289,11 +329,16 @@ impl TcpProxyServer {
                     }
                     _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                         msg_buffer.tick(&mut write).await?;
+
+                        if last_activity.lock().unwrap().elapsed() > idle_timeout {
+                            info!("Session {} idle > {:?}, closing", session_id, idle_timeout);
+                            break;
+                        }
                     }
             }
         }
         // This times out after 60 seconds by default.
-        #[allow(unreachable_code)]
+        // `_session_prune_guard` prunes the session from the shared map on drop here.
         Ok(())
     }
 
@@ -335,7 +380,7 @@ mod tests {
     async fn test_run_with_shutdown() -> Result<()> {
         let config_dir = TempDir::new()?;
         let mut server =
-            TcpProxyServer::new(config_dir.path().to_str().unwrap(), None, None).await?;
+            TcpProxyServer::new(config_dir.path().to_str().unwrap(), None, None, 3600).await?;
 
         // Getter for shutdown signal tx
         let shutdown_tx = server.disconnect_signal();
