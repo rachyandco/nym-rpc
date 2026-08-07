@@ -37,6 +37,10 @@ struct Args {
     /// Close sessions with no traffic in either direction for this many seconds
     #[clap(long, default_value_t = 3600)]
     session_idle_timeout: u64,
+
+    /// Maximum number of concurrent sessions allowed
+    #[clap(long, default_value_t = 512)]
+    max_sessions: usize,
 }
 
 #[tokio::main]
@@ -78,6 +82,7 @@ async fn main() -> Result<()> {
         args.env,
         args.pin_upstream,
         args.session_idle_timeout,
+        args.max_sessions,
     )
     .await?;
 

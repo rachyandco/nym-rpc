@@ -61,6 +61,7 @@ pub struct TcpProxyServer {
     cancel_token: CancellationToken,
     pinned_upstream: Option<String>,
     session_idle_timeout: std::time::Duration,
+    max_sessions: usize,
 }
 
 impl TcpProxyServer {
@@ -70,6 +71,7 @@ impl TcpProxyServer {
         env: Option<String>,
         pinned_upstream: Option<String>,
         idle_timeout_secs: u64,
+        max_sessions: usize,
     ) -> Result<Self> {
         info!("creating client");
         debug!("Loading env file: {:?}", env);
@@ -113,6 +115,7 @@ impl TcpProxyServer {
             shutdown_rx,
             pinned_upstream,
             session_idle_timeout: std::time::Duration::from_secs(idle_timeout_secs),
+            max_sessions,
         })
     }
 
@@ -124,6 +127,7 @@ impl TcpProxyServer {
         let sessions = self.sessions();
         let pinned_upstream = self.pinned_upstream.clone();
         let session_idle_timeout = self.session_idle_timeout;
+        let max_sessions = self.max_sessions;
 
         let mut shutdown_rx =
             std::mem::replace(&mut self.shutdown_rx, tokio::sync::mpsc::channel(1).1);
@@ -159,6 +163,11 @@ impl TcpProxyServer {
 
                         if !sessions.contains_key(&session_id) {
                             debug!("Got message for a new session");
+
+                            if sessions.len() >= max_sessions {
+                                error!("Session limit {} reached, dropping new session {}", max_sessions, session_id);
+                                continue;
+                            }
 
                             let (client_upstream, stripped_data) = match message.message() {
                                 Payload::Data(data) => extract_upstream_header(data),
@@ -380,7 +389,7 @@ mod tests {
     async fn test_run_with_shutdown() -> Result<()> {
         let config_dir = TempDir::new()?;
         let mut server =
-            TcpProxyServer::new(config_dir.path().to_str().unwrap(), None, None, 3600).await?;
+            TcpProxyServer::new(config_dir.path().to_str().unwrap(), None, None, 3600, 512).await?;
 
         // Getter for shutdown signal tx
         let shutdown_tx = server.disconnect_signal();
