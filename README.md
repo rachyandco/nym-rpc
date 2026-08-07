@@ -4,6 +4,44 @@ A privacy-preserving RPC proxy that routes RPC requests through the [Nym mixnet]
 
 > ⚠️ **Note**: This project is currently under active development and not yet ready for production use. See [TODO](#todo) section below for planned features and improvements.
 
+## 🚀 Quick start: private Zcash wallet with zkool
+
+Run the [zkool](https://github.com/hhanh00/zkool2) Zcash wallet over the Nym
+mixnet in three steps. No account, no config files — just a download and one
+command.
+
+**1. Download the client.** Grab `nym-rpc-client-linux-x86_64` from the
+[latest release](https://github.com/rachyandco/nym-rpc/releases) and make it
+executable:
+
+```bash
+chmod +x nym-rpc-client-linux-x86_64
+```
+
+**2. Start the tunnel** pointing at the live Zaino-over-Nym server. Leave it
+running — it listens on `127.0.0.1:8137`:
+
+```bash
+./nym-rpc-client-linux-x86_64 --zcash \
+  -x BbTPrU1gNTsPiieXdC58xkp5QFSHhUUM98BP1Rm2adf9.GKiGLNQB116YszFwbuweeL2GsrfpHpuUzq6JuqFQ8EEE@ZXSDhRTKU5HgMpH8ma78FftvLiKyZ6jWL1e2U7GD7gQ
+```
+
+You should see `Raw tunnel listening on 127.0.0.1:8137`. (Press Ctrl+C to
+stop it when you're done.)
+
+**3. Point zkool at it.** Open zkool → **Settings**, turn on **Light Node**,
+and set **Light Node Server** to `http://127.0.0.1:8137`:
+
+![zkool Light Node settings](docs/img/zkool-light-node-settings.png)
+
+That's it — zkool now syncs and sends over the Nym mixnet. Your wallet traffic
+reaches Zcash without ever exposing your IP to the light-wallet server.
+
+> First sync over the mixnet is slow (it streams a lot of blocks); it's best
+> for ongoing refresh and sending. A broadcast may briefly show an error even
+> when it succeeded — check the transaction on a block explorer before
+> resending.
+
 ## Overview
 
 Nym RPC enables anonymous and private access to blockchain RPC endpoints by routing requests through the Nym mixnet. This protects users' IP addresses, request patterns, and other metadata from being exposed to RPC providers.
