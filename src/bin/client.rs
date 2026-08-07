@@ -8,6 +8,16 @@ use nym_sdk::mixnet::Recipient;
 use rand::Rng;
 use tracing::debug;
 
+/// Terminate immediately on Ctrl+C. The nym-sdk's own graceful teardown
+/// lingers up to `request_timeout` seconds (default 60) per open session and
+/// tears down the whole client pool, so a plain SIGINT can appear to hang.
+/// A user pressing Ctrl+C wants the process gone; only the local SURB reply
+/// cache is dropped uncleanly, and it is rebuilt on next start.
+fn shutdown_now() -> ! {
+    eprintln!("\nCtrl+C received — shutting down.");
+    std::process::exit(0);
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "nym-rpc-client")]
 #[command(
@@ -110,7 +120,10 @@ async fn main() -> Result<()> {
                 "Raw tunnel listening on {}:{} — point your wallet at http://{}:{}",
                 cfg.listen_address, cfg.listen_port, cfg.listen_address, cfg.listen_port
             );
-            proxy_client.run().await?;
+            tokio::select! {
+                result = proxy_client.run() => { result?; }
+                _ = tokio::signal::ctrl_c() => shutdown_now(),
+            }
         }
         ClientMode::Http { rpc_provider } => {
             // extract HOST from RPC provider URL
@@ -149,6 +162,7 @@ async fn main() -> Result<()> {
                         eprintln!("HTTP proxy server error: {}", e);
                     }
                 }
+                _ = tokio::signal::ctrl_c() => shutdown_now(),
             }
         }
     }
