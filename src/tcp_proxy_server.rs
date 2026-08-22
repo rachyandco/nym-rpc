@@ -157,22 +157,87 @@ impl TcpProxyServer {
         let mut shutdown_rx =
             std::mem::replace(&mut self.shutdown_rx, tokio::sync::mpsc::channel(1).1);
 
+        let spawn_rx = rx.clone();
+        let spawn_token = handle_token.clone();
+        let spawn_sessions = Arc::clone(&sessions);
+        let spawn_stats = Arc::clone(&stats);
+        let spawn_session = move |upstream_address: String, session_id: Uuid| {
+            tokio::spawn(Self::session_handler(
+                upstream_address,
+                session_id,
+                spawn_rx.clone(),
+                mixnet_sender.clone(),
+                spawn_token.clone(),
+                spawn_sessions.clone(),
+                session_idle_timeout,
+                spawn_stats.clone(),
+            ));
+        };
+
         // Then get the message stream: poll this for incoming messages
         let message_stream = self.mixnet_client_mut();
 
+        let result = Self::message_loop(
+            message_stream,
+            &mut shutdown_rx,
+            &handle_token,
+            &tx,
+            &sessions,
+            &stats,
+            pinned_upstream.as_deref(),
+            max_sessions,
+            spawn_session,
+        )
+        .await;
+
+        self.shutdown_rx = shutdown_rx;
+        result
+    }
+
+    /// Drives the inbound mixnet message loop until either a shutdown is
+    /// requested (Ok) or the message stream terminates (Err). A terminated
+    /// stream means the embedded mixnet client is dead — the SDK does not
+    /// recover from a lost gateway connection, so staying alive would leave
+    /// the exit unreachable while looking healthy to the supervisor. Callers
+    /// must treat the error as fatal and exit so systemd can restart us.
+    #[allow(clippy::too_many_arguments)]
+    async fn message_loop<S, F>(
+        mut message_stream: S,
+        shutdown_rx: &mut tokio::sync::mpsc::Receiver<()>,
+        handle_token: &CancellationToken,
+        tx: &tokio::sync::watch::Sender<Option<(ProxiedMessage, AnonymousSenderTag)>>,
+        sessions: &DashMap<Uuid, UpstreamAddress>,
+        stats: &ProxyStats,
+        pinned_upstream: Option<&str>,
+        max_sessions: usize,
+        mut spawn_session: F,
+    ) -> Result<()>
+    where
+        S: tokio_stream::Stream<Item = nym_sdk::mixnet::ReconstructedMessage> + Unpin,
+        F: FnMut(String, Uuid),
+    {
         loop {
             tokio::select! {
                 Some(()) = shutdown_rx.recv() => {
                     debug!("Received shutdown signal, stopping TcpProxyServer");
                     handle_token.cancel();
-                    break;
+                    return Ok(());
                 }
                 // On our Mixnet client getting a new message:
                 // - Check if the attached sessionID exists.
                 // - If !sessionID, spawn a new session_handler() task.
                 // - Send the message down tx => rx in our handler.
                 message = message_stream.next() => {
-                    if let Some(new_message) = message {
+                    let Some(new_message) = message else {
+                        error!(
+                            "Mixnet message stream terminated: the embedded mixnet client is dead \
+                             and cannot recover. Shutting down so the supervisor can restart us."
+                        );
+                        handle_token.cancel();
+                        anyhow::bail!("mixnet message stream terminated unexpectedly");
+                    };
+
+                    {
                         let mut message: ProxiedMessage = match bincode::deserialize(&new_message.message) {
                             Ok(msg) => {
                                 debug!("received: {}", msg);
@@ -224,7 +289,7 @@ impl TcpProxyServer {
                                 }
                             };
 
-                            let upstream_address = match resolve_upstream(pinned_upstream.as_deref(), &client_upstream) {
+                            let upstream_address = match resolve_upstream(pinned_upstream, &client_upstream) {
                                 Some(addr) => addr,
                                 None => {
                                     error!("No upstream available for session {}, dropping", session_id);
@@ -240,16 +305,7 @@ impl TcpProxyServer {
                             sessions.insert(session_id, upstream_address.clone());
                             stats.total_sessions.fetch_add(1, Ordering::Relaxed);
 
-                            tokio::spawn(Self::session_handler(
-                                upstream_address,
-                                session_id,
-                                rx.clone(),
-                                mixnet_sender.clone(),
-                                handle_token.clone(),
-                                sessions.clone(),
-                                session_idle_timeout,
-                                stats.clone(),
-                            ));
+                            spawn_session(upstream_address, session_id);
 
                             info!("Spawned a new session handler: {}", session_id);
                         }
@@ -267,9 +323,6 @@ impl TcpProxyServer {
                 }
             }
         }
-
-        self.shutdown_rx = shutdown_rx;
-        Ok(())
     }
 
     // The main body of our logic, triggered on each received new sessionID. To deal with assumptions about
@@ -460,7 +513,116 @@ impl TcpProxyServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nym_sdk::mixnet::ReconstructedMessage;
     use tempfile::TempDir;
+
+    type ProxiedWatchValue = Option<(ProxiedMessage, AnonymousSenderTag)>;
+
+    fn loop_fixture() -> (
+        tokio::sync::watch::Sender<ProxiedWatchValue>,
+        tokio::sync::watch::Receiver<ProxiedWatchValue>,
+        CancellationToken,
+        DashMap<Uuid, UpstreamAddress>,
+        ProxyStats,
+    ) {
+        let (tx, watch_rx) = tokio::sync::watch::channel(None);
+        (
+            tx,
+            watch_rx,
+            CancellationToken::new(),
+            DashMap::new(),
+            ProxyStats::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn message_loop_errors_when_stream_terminates() {
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (tx, _watch_rx, token, sessions, stats) = loop_fixture();
+
+        let result = TcpProxyServer::message_loop(
+            tokio_stream::empty::<ReconstructedMessage>(),
+            &mut shutdown_rx,
+            &token,
+            &tx,
+            &sessions,
+            &stats,
+            Some("127.0.0.1:9"),
+            512,
+            |_addr: String, _id: Uuid| panic!("no session must spawn"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a terminated mixnet stream means the client is dead and must be a fatal error"
+        );
+        assert!(
+            token.is_cancelled(),
+            "existing sessions must be cancelled when the mixnet client dies"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_loop_exits_cleanly_on_shutdown_signal() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        shutdown_tx.send(()).await.unwrap();
+        let (tx, _watch_rx, token, sessions, stats) = loop_fixture();
+
+        let result = TcpProxyServer::message_loop(
+            tokio_stream::pending::<ReconstructedMessage>(),
+            &mut shutdown_rx,
+            &token,
+            &tx,
+            &sessions,
+            &stats,
+            Some("127.0.0.1:9"),
+            512,
+            |_addr: String, _id: Uuid| panic!("no session must spawn"),
+        )
+        .await;
+
+        assert!(result.is_ok(), "a requested shutdown is not an error");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn message_loop_spawns_session_and_dispatches_message() {
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (tx, watch_rx, token, sessions, stats) = loop_fixture();
+
+        let session_id = Uuid::new_v4();
+        let msg = ProxiedMessage::new(Payload::Data(b"hello".to_vec()), session_id, 1);
+        let incoming = ReconstructedMessage {
+            message: bincode::serialize(&msg).unwrap(),
+            sender_tag: Some(AnonymousSenderTag::from_bytes([7u8; 16])),
+        };
+
+        let mut spawned = Vec::new();
+        let result = TcpProxyServer::message_loop(
+            tokio_stream::iter(vec![incoming]),
+            &mut shutdown_rx,
+            &token,
+            &tx,
+            &sessions,
+            &stats,
+            Some("127.0.0.1:9137"),
+            512,
+            |addr: String, id: Uuid| spawned.push((addr, id)),
+        )
+        .await;
+
+        // The stream ends after the one message, so the loop still exits fatally,
+        // but the message must have been processed first.
+        assert!(result.is_err());
+        assert_eq!(spawned, vec![("127.0.0.1:9137".to_string(), session_id)]);
+        assert!(sessions.contains_key(&session_id));
+        assert_eq!(stats.total_sessions.load(Ordering::Relaxed), 1);
+        assert!(
+            watch_rx.borrow().is_some(),
+            "message must be dispatched to session handlers"
+        );
+    }
 
     #[tokio::test]
     async fn test_run_with_shutdown() -> Result<()> {
