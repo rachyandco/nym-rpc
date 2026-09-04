@@ -34,6 +34,7 @@ async fn raw_bytes_roundtrip_through_mixnet() -> Result<()> {
         Some("127.0.0.1:19999".into()),
         3600,
         512,
+        nym_rpc::watchdog::WatchdogConfig::default(),
     )
     .await?;
     let server_addr = *server.nym_address();

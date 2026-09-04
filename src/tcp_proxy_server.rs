@@ -10,13 +10,14 @@
 //! TODO: allowlist providers, test session_handler
 
 use crate::common::{extract_upstream_header, resolve_upstream};
+use crate::watchdog::{Watchdog, WatchdogConfig, run_watchdog};
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use nym_network_defaults::setup_env;
 use nym_sdk::mixnet::Recipient;
 use nym_sdk::mixnet::{
-    AnonymousSenderTag, MixnetClient, MixnetClientBuilder, MixnetClientSender, MixnetMessageSender,
-    NymNetworkDetails, StoragePaths,
+    AnonymousSenderTag, IncludedSurbs, MixnetClient, MixnetClientBuilder, MixnetClientSender,
+    MixnetMessageSender, NymNetworkDetails, StoragePaths,
 };
 use nym_sdk::tcp_proxy::utils::{MessageBuffer, Payload, ProxiedMessage};
 use std::path::PathBuf;
@@ -85,6 +86,8 @@ pub struct TcpProxyServer {
     pinned_upstream: Option<String>,
     session_idle_timeout: std::time::Duration,
     max_sessions: usize,
+    watchdog: Arc<Watchdog>,
+    watchdog_interval: std::time::Duration,
 }
 
 impl TcpProxyServer {
@@ -95,6 +98,7 @@ impl TcpProxyServer {
         pinned_upstream: Option<String>,
         idle_timeout_secs: u64,
         max_sessions: usize,
+        watchdog_config: WatchdogConfig,
     ) -> Result<Self> {
         info!("creating client");
         debug!("Loading env file: {:?}", env);
@@ -140,6 +144,8 @@ impl TcpProxyServer {
             pinned_upstream,
             session_idle_timeout: std::time::Duration::from_secs(idle_timeout_secs),
             max_sessions,
+            watchdog: Watchdog::new(watchdog_config.timeout),
+            watchdog_interval: watchdog_config.interval,
         })
     }
 
@@ -174,6 +180,31 @@ impl TcpProxyServer {
             ));
         };
 
+        // Liveness watchdog: pings our own Nym address and cancels
+        // `watchdog_dead` if no ping completes a round trip within the timeout.
+        let watchdog = Arc::clone(&self.watchdog);
+        let watchdog_dead = CancellationToken::new();
+        let watchdog_shutdown = CancellationToken::new();
+        let self_address = *self.nym_address();
+        let ping_sender = self.mixnet_client_sender();
+        let watchdog_task = tokio::spawn(run_watchdog(
+            Arc::clone(&watchdog),
+            self.watchdog_interval,
+            move |ping: Vec<u8>| {
+                let sender = Arc::clone(&ping_sender);
+                async move {
+                    sender
+                        .read()
+                        .await
+                        .send_message(self_address, ping, IncludedSurbs::ExposeSelfAddress)
+                        .await
+                        .map_err(anyhow::Error::from)
+                }
+            },
+            watchdog_dead.clone(),
+            watchdog_shutdown.clone(),
+        ));
+
         // Then get the message stream: poll this for incoming messages
         let message_stream = self.mixnet_client_mut();
 
@@ -184,22 +215,30 @@ impl TcpProxyServer {
             &tx,
             &sessions,
             &stats,
+            &watchdog,
+            &watchdog_dead,
             pinned_upstream.as_deref(),
             max_sessions,
             spawn_session,
         )
         .await;
 
+        watchdog_shutdown.cancel();
+        watchdog_task.abort();
         self.shutdown_rx = shutdown_rx;
         result
     }
 
     /// Drives the inbound mixnet message loop until either a shutdown is
-    /// requested (Ok) or the message stream terminates (Err). A terminated
-    /// stream means the embedded mixnet client is dead — the SDK does not
-    /// recover from a lost gateway connection, so staying alive would leave
+    /// requested (Ok) or the mixnet client is found dead (Err), which happens
+    /// when the message stream terminates or the watchdog reports that no
+    /// self-ping has completed a round trip within its timeout. The SDK does
+    /// not recover from a lost gateway connection, so staying alive would leave
     /// the exit unreachable while looking healthy to the supervisor. Callers
     /// must treat the error as fatal and exit so systemd can restart us.
+    ///
+    /// Watchdog pings arriving on the stream are handed to `watchdog` and never
+    /// reach session handling.
     #[allow(clippy::too_many_arguments)]
     async fn message_loop<S, F>(
         mut message_stream: S,
@@ -208,6 +247,8 @@ impl TcpProxyServer {
         tx: &tokio::sync::watch::Sender<Option<(ProxiedMessage, AnonymousSenderTag)>>,
         sessions: &DashMap<Uuid, UpstreamAddress>,
         stats: &ProxyStats,
+        watchdog: &Watchdog,
+        watchdog_dead: &CancellationToken,
         pinned_upstream: Option<&str>,
         max_sessions: usize,
         mut spawn_session: F,
@@ -223,6 +264,15 @@ impl TcpProxyServer {
                     handle_token.cancel();
                     return Ok(());
                 }
+                _ = watchdog_dead.cancelled() => {
+                    error!(
+                        "Watchdog declared the mixnet client dead: no self-ping returned within {:?}. \
+                         Shutting down so the supervisor can restart us.",
+                        watchdog.timeout()
+                    );
+                    handle_token.cancel();
+                    anyhow::bail!("mixnet watchdog timed out: no self-ping round trip within {:?}", watchdog.timeout());
+                }
                 // On our Mixnet client getting a new message:
                 // - Check if the attached sessionID exists.
                 // - If !sessionID, spawn a new session_handler() task.
@@ -236,6 +286,12 @@ impl TcpProxyServer {
                         handle_token.cancel();
                         anyhow::bail!("mixnet message stream terminated unexpectedly");
                     };
+
+                    // Our own watchdog ping coming back: proves the send and
+                    // receive paths both work. Never session traffic.
+                    if watchdog.observe(&new_message.message) {
+                        continue;
+                    }
 
                     {
                         let mut message: ProxiedMessage = match bincode::deserialize(&new_message.message) {
@@ -497,6 +553,10 @@ impl TcpProxyServer {
         Arc::clone(&self.stats)
     }
 
+    pub fn watchdog(&self) -> Arc<Watchdog> {
+        Arc::clone(&self.watchdog)
+    }
+
     pub fn mixnet_client_sender(&self) -> Arc<RwLock<MixnetClientSender>> {
         Arc::clone(&self.mixnet_client_sender)
     }
@@ -513,6 +573,7 @@ impl TcpProxyServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watchdog::Watchdog;
     use nym_sdk::mixnet::ReconstructedMessage;
     use tempfile::TempDir;
 
@@ -547,6 +608,8 @@ mod tests {
             &tx,
             &sessions,
             &stats,
+            &Watchdog::new(std::time::Duration::from_secs(300)),
+            &CancellationToken::new(),
             Some("127.0.0.1:9"),
             512,
             |_addr: String, _id: Uuid| panic!("no session must spawn"),
@@ -576,6 +639,8 @@ mod tests {
             &tx,
             &sessions,
             &stats,
+            &Watchdog::new(std::time::Duration::from_secs(300)),
+            &CancellationToken::new(),
             Some("127.0.0.1:9"),
             512,
             |_addr: String, _id: Uuid| panic!("no session must spawn"),
@@ -606,6 +671,8 @@ mod tests {
             &tx,
             &sessions,
             &stats,
+            &Watchdog::new(std::time::Duration::from_secs(300)),
+            &CancellationToken::new(),
             Some("127.0.0.1:9137"),
             512,
             |addr: String, id: Uuid| spawned.push((addr, id)),
@@ -625,10 +692,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_loop_feeds_watchdog_pings_to_watchdog_not_sessions() {
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (tx, watch_rx, token, sessions, stats) = loop_fixture();
+        let watchdog = Watchdog::new(std::time::Duration::from_secs(300));
+
+        let ping = watchdog.make_ping();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let age_before = watchdog.last_pong_age();
+        let incoming = ReconstructedMessage {
+            message: ping,
+            sender_tag: None,
+        };
+
+        let result = TcpProxyServer::message_loop(
+            tokio_stream::iter(vec![incoming]),
+            &mut shutdown_rx,
+            &token,
+            &tx,
+            &sessions,
+            &stats,
+            &watchdog,
+            &CancellationToken::new(),
+            Some("127.0.0.1:9"),
+            512,
+            |_addr: String, _id: Uuid| panic!("a watchdog ping must never open a session"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "stream ended, loop exits fatally as before"
+        );
+        assert!(
+            watchdog.last_pong_age() < age_before,
+            "the returned ping must be credited as a pong"
+        );
+        assert!(sessions.is_empty());
+        assert_eq!(stats.total_sessions.load(Ordering::Relaxed), 0);
+        assert!(
+            watch_rx.borrow().is_none(),
+            "nothing dispatched to session handlers"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_loop_errors_when_watchdog_declares_death() {
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (tx, _watch_rx, token, sessions, stats) = loop_fixture();
+        let dead = CancellationToken::new();
+        dead.cancel();
+
+        let result = TcpProxyServer::message_loop(
+            tokio_stream::pending::<ReconstructedMessage>(),
+            &mut shutdown_rx,
+            &token,
+            &tx,
+            &sessions,
+            &stats,
+            &Watchdog::new(std::time::Duration::from_secs(300)),
+            &dead,
+            Some("127.0.0.1:9"),
+            512,
+            |_addr: String, _id: Uuid| panic!("no session must spawn"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a dead mixnet client detected by the watchdog must be a fatal error"
+        );
+        assert!(
+            token.is_cancelled(),
+            "existing sessions must be cancelled when the watchdog fires"
+        );
+    }
+
+    #[tokio::test]
     async fn test_run_with_shutdown() -> Result<()> {
         let config_dir = TempDir::new()?;
-        let mut server =
-            TcpProxyServer::new(config_dir.path().to_str().unwrap(), None, None, 3600, 512).await?;
+        let mut server = TcpProxyServer::new(
+            config_dir.path().to_str().unwrap(),
+            None,
+            None,
+            3600,
+            512,
+            WatchdogConfig::default(),
+        )
+        .await?;
 
         // Getter for shutdown signal tx
         let shutdown_tx = server.disconnect_signal();

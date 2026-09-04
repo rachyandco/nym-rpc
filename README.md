@@ -141,7 +141,20 @@ that address to your users. Two more flags harden a public deployment:
 `--session-idle-timeout <secs>` (default `3600`) closes sessions with no
 traffic in either direction, and `--max-sessions <n>` (default `512`) caps
 concurrent sessions. Monitoring stats (active/total sessions, bytes
-forwarded) are exposed at `GET /api/v1/stats`.
+forwarded, watchdog liveness) are exposed at `GET /api/v1/stats`.
+
+**Mixnet watchdog.** The embedded Nym client can lose its gateway connection
+in ways it never reports and never recovers from: the process keeps running
+but every outbound packet is dropped, and clients simply get no replies. To
+catch this the server sends a tagged self-ping to its own Nym address every
+`--watchdog-interval <secs>` (default `60`). If no ping has completed a
+round trip for `--watchdog-timeout <secs>` (default `300`), the server logs
+the failure and exits non-zero so systemd (`Restart=on-failure`) brings it
+back within seconds. `GET /api/v1/health` reflects the same signal: it
+returns `200 {"status":"up"}` while pings are returning and
+`503 {"status":"down","reason":...}` once the watchdog has timed out, so an
+external monitor can alert on it. Each pong is logged at info level
+(`watchdog: pong received`), which doubles as a heartbeat in the journal.
 
 > ⚠️ On a public deployment the HTTP API listener **must** stay on loopback or
 > behind a firewall (never `0.0.0.0`): the live session and byte counters in

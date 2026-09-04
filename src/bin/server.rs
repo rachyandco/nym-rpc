@@ -3,6 +3,7 @@ use clap::Parser;
 use nym_node_requests::api::v1::node::models::NodeDescription;
 use nym_rpc::api_server::{TcpProxyHttpConfig, start_http_server};
 use nym_rpc::tcp_proxy_server::TcpProxyServer;
+use nym_rpc::watchdog::WatchdogConfig;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -42,6 +43,15 @@ struct Args {
     /// Maximum number of concurrent sessions allowed
     #[clap(long, default_value_t = 512)]
     max_sessions: usize,
+
+    /// Send a liveness self-ping through the mixnet every this many seconds
+    #[clap(long, default_value_t = WatchdogConfig::DEFAULT_INTERVAL_SECS)]
+    watchdog_interval: u64,
+
+    /// Exit (for systemd to restart us) when no self-ping has returned for
+    /// this many seconds. Must be longer than --watchdog-interval
+    #[clap(long, default_value_t = WatchdogConfig::DEFAULT_TIMEOUT_SECS)]
+    watchdog_timeout: u64,
 }
 
 #[tokio::main]
@@ -78,12 +88,19 @@ async fn main() -> Result<()> {
         ),
     }
 
+    let watchdog_config = WatchdogConfig::new(args.watchdog_interval, args.watchdog_timeout)?;
+    info!(
+        "Mixnet watchdog: self-ping every {}s, fatal after {}s without a round trip",
+        args.watchdog_interval, args.watchdog_timeout
+    );
+
     let mut server = TcpProxyServer::new(
         &config_dir,
         args.env,
         args.pin_upstream,
         args.session_idle_timeout,
         args.max_sessions,
+        watchdog_config,
     )
     .await?;
 
@@ -94,6 +111,7 @@ async fn main() -> Result<()> {
         &http_config,
         server.stats(),
         server.sessions(),
+        server.watchdog(),
     )
     .await?;
 
