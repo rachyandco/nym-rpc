@@ -537,6 +537,18 @@ impl TcpProxyServer {
         self.shutdown_tx.clone()
     }
 
+    /// Disconnects the embedded mixnet client and waits for its tasks to stop.
+    ///
+    /// Call this on every exit path, after `run_with_shutdown` has returned.
+    /// The SDK only marks its on-disk reply store as valid while shutting down
+    /// through `disconnect`; a process that just exits leaves the store
+    /// unflushed, and the next start rejects it and archives it as
+    /// `persistent_reply_store.sqlite._<timestamp>.corrupted`.
+    pub async fn disconnect(self) {
+        self.cancel_token.cancel();
+        self.mixnet_client.disconnect().await;
+    }
+
     pub fn nym_address(&self) -> &Recipient {
         self.mixnet_client.nym_address()
     }
@@ -766,6 +778,43 @@ mod tests {
             token.is_cancelled(),
             "existing sessions must be cancelled when the watchdog fires"
         );
+    }
+
+    /// Reply stores the SDK rejected at startup and archived, by file name.
+    fn archived_reply_stores(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".corrupted"))
+            .collect()
+    }
+
+    /// Talks to the live mixnet, like `test_run_with_shutdown`.
+    #[tokio::test]
+    async fn reply_store_is_reusable_after_shutdown() -> Result<()> {
+        let config_dir = TempDir::new()?;
+        let dir = config_dir.path().to_str().unwrap();
+
+        let server =
+            TcpProxyServer::new(dir, None, None, 3600, 512, WatchdogConfig::default()).await?;
+        server.disconnect().await;
+
+        // The gateway authenticates with a second-resolution timestamp and
+        // rejects a login that is not strictly newer than the previous one,
+        // so an immediate reconnect fails for reasons unrelated to this test.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Second start in the same state directory, as after a service restart.
+        let server =
+            TcpProxyServer::new(dir, None, None, 3600, 512, WatchdogConfig::default()).await?;
+        server.disconnect().await;
+
+        let archived = archived_reply_stores(config_dir.path());
+        assert!(
+            archived.is_empty(),
+            "the reply store written by the first run was rejected on restart: {archived:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

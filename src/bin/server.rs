@@ -124,12 +124,55 @@ async fn main() -> Result<()> {
 
     info!("Starting TCP proxy server...");
 
+    // Turn SIGTERM (systemd stop) and Ctrl+C into a shutdown request instead
+    // of letting the default signal action kill the process mid-flight.
+    let shutdown_tx = server.disconnect_signal();
+    tokio::spawn(async move {
+        wait_for_termination_signal().await;
+        info!("Termination signal received, shutting down...");
+        let _ = shutdown_tx.send(()).await;
+    });
+
     // Run the server
-    if let Err(e) = server.run_with_shutdown().await {
+    let result = server.run_with_shutdown().await;
+    if let Err(e) = &result {
         error!("Server error: {}", e);
-        return Err(e);
     }
 
+    // Disconnect on every exit path, fatal ones included, so the SDK flushes
+    // its reply store. Bounded: a dead mixnet client must not keep the process
+    // from exiting and being restarted by the supervisor.
+    match tokio::time::timeout(DISCONNECT_TIMEOUT, server.disconnect()).await {
+        Ok(()) => info!("Mixnet client disconnected"),
+        Err(_) => warn!(
+            "Mixnet client did not disconnect within {:?}, exiting anyway",
+            DISCONNECT_TIMEOUT
+        ),
+    }
+
+    result?;
     info!("Server shut down gracefully");
     Ok(())
+}
+
+/// Upper bound for the mixnet client teardown at exit. Well below systemd's
+/// default 90 s stop timeout.
+const DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Resolves on the first SIGTERM or SIGINT.
+async fn wait_for_termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
